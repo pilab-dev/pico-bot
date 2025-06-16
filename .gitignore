@@ -1,0 +1,6 @@
+# Ignore binary folder
+bin
+.env
+# Ignore debugging files
+*.log
+*.txt
