@@ -55,8 +55,10 @@ func main() {
 	}
 
 	commitLog := ""
+	regularPRs := ""
+	dependabotPRs := ""
 
-	log.Println("Step 1: Fetching recent activity from GitHub organizatios")
+	log.Println("Step 1: Fetching recent activity from GitHub organizations")
 	// 1. Fetch GitHub Activities
 	for _, org := range githubOrgs {
 		fmt.Println("  Fetching activity for", org)
@@ -64,29 +66,62 @@ func main() {
 		if err != nil {
 			log.Fatalf("Failed to fetch GitHub activity: %v", err)
 		}
-
 		if commitActivity != "" {
-			commitLog = commitLog + fmt.Sprintf("\nOrganization: %s\n\n%s", org, commitActivity)
+			commitLog += fmt.Sprintf("\nOrganization: %s\n\n%s", org, commitActivity)
+		}
+
+		// Fetch pull requests
+		regularPrActivity, dependabotPrActivity, err := fetchOrgPullRequests(ctx, org)
+		if err != nil {
+			log.Fatalf("Failed to fetch GitHub pull requests: %v", err)
+		}
+		if regularPrActivity != "" {
+			regularPRs += fmt.Sprintf("\nOrganization: %s\n\n%s", org, regularPrActivity)
+		}
+		if dependabotPrActivity != "" {
+			dependabotPRs += fmt.Sprintf("\nOrganization: %s\n\n%s", org, dependabotPrActivity)
 		}
 	}
 
 	summary := ""
-	if commitLog == "" {
-		log.Println("No new commits found in the last 24 hours.")
-		summary = "No new commits in the last 24 hours. A good day to plan and refactor! 🤔"
+	if commitLog == "" && regularPRs == "" && dependabotPRs == "" {
+		log.Println("No new activity in the last 24 hours.")
+		summary = "No new commits or open pull requests in the last 24 hours. A good day to plan and refactor! 🤔"
 	} else {
 		// 2. Summarize with Gemini
 		log.Println("Step 2: Summarizing activity with Gemini...")
-		prompt := fmt.Sprintf(
-			"You are a helpful project manager bot. Summarize the following GitHub commit activity from the last 24 hours for a daily team update. "+
-				"Organize the summary by repository. Use markdown lists and bold text to make it readable."+
-				"Only use Slack-supported markdown:\n\nUse *bold*, _italic_, ~strikethrough~, lists (- item), blockquotes (>), and inline code (`code`). \n"+
-				"Do not use headings (#), tables, or HTML.\n"+
-				"Use lists and bold for repository names.\n"+
-				"Separate paragraphs with double line breaks.\n"+
-				"Make the markdown readable in a Slack channel message.\n"+
-				" Here is the raw commit data:\n\n%s", commitLog,
-		)
+		var promptBuilder strings.Builder
+		promptBuilder.WriteString("You are a helpful project manager bot. For a daily team update, summarize the following GitHub activity. ")
+		promptBuilder.WriteString("Organize the summary by repository. Use markdown lists and bold text to make it readable. ")
+		promptBuilder.WriteString("Only use Slack-supported markdown: *bold*, _italic_, ~strikethrough~, lists (- item), blockquotes (>), and inline code (`code`). ")
+		promptBuilder.WriteString("Do not use headings (#), tables, or HTML.\n\n")
+
+		if commitLog != "" {
+			promptBuilder.WriteString("First, summarize the recent commits under a '*Recent Commits*' heading.\n")
+		}
+		if regularPRs != "" {
+			promptBuilder.WriteString("Next, list all open pull requests under a '*Pull Requests*' heading.\n")
+		}
+		if dependabotPRs != "" {
+			promptBuilder.WriteString("Finally, list all open Dependabot pull requests under a '*Dependabot Updates*' heading.\n")
+		}
+
+		promptBuilder.WriteString("\nHere is the raw data:\n")
+
+		if commitLog != "" {
+			promptBuilder.WriteString("\n--- Commit Log ---\n")
+			promptBuilder.WriteString(commitLog)
+		}
+		if regularPRs != "" {
+			promptBuilder.WriteString("\n--- Open Pull Requests ---\n")
+			promptBuilder.WriteString(regularPRs)
+		}
+		if dependabotPRs != "" {
+			promptBuilder.WriteString("\n--- Dependabot Pull Requests ---\n")
+			promptBuilder.WriteString(dependabotPRs)
+		}
+
+		prompt := promptBuilder.String()
 
 		os.WriteFile("prompt.txt", []byte(prompt), 0o644)
 
@@ -158,6 +193,49 @@ func fetchOrgActivity(ctx context.Context, org string) (string, error) {
 	}
 
 	return activityBuilder.String(), nil
+}
+
+// fetchOrgPullRequests retrieves open pull requests from all repositories in a GitHub organization,
+// separating them into regular and Dependabot PRs.
+func fetchOrgPullRequests(ctx context.Context, org string) (string, string, error) {
+	ts := oauth2.StaticTokenSource(&oauth2.Token{AccessToken: githubToken})
+	tc := oauth2.NewClient(ctx, ts)
+	client := github.NewClient(tc)
+
+	repos, _, err := client.Repositories.ListByOrg(ctx, org, &github.RepositoryListByOrgOptions{Type: "all"})
+	if err != nil {
+		return "", "", fmt.Errorf("listing repositories for org %s: %w", org, err)
+	}
+
+	var regularPrBuilder strings.Builder
+	var dependabotPrBuilder strings.Builder
+
+	for _, repo := range repos {
+		pulls, _, err := client.PullRequests.List(ctx, org, *repo.Name, &github.PullRequestListOptions{State: "open"})
+		if err != nil {
+			log.Printf("Could not fetch pull requests for repo %s: %v. Skipping.", *repo.Name, err)
+			continue
+		}
+
+		if len(pulls) > 0 {
+			for _, pr := range pulls {
+				author := pr.GetUser().GetLogin()
+				line := fmt.Sprintf("Repo: %s, Author: %s, Title: %s\n",
+					*repo.Name,
+					author,
+					pr.GetTitle(),
+				)
+
+				if strings.Contains(author, "dependabot") {
+					dependabotPrBuilder.WriteString(line)
+				} else {
+					regularPrBuilder.WriteString(line)
+				}
+			}
+		}
+	}
+
+	return regularPrBuilder.String(), dependabotPrBuilder.String(), nil
 }
 
 // getGeminiResponse sends a prompt to the Gemini API and returns the text response.
