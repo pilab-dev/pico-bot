@@ -1,13 +1,19 @@
 package cmd
 
 import (
+	"context"
 	"fmt"
 	"log"
 	"net/netip"
+	"net/url"
+	"os"
+	"os/exec"
 	"sort"
+	"strings"
 	"sync"
 	"time"
 
+	"go.pilab.hu/cloud/pico-bot/internal/threatdb"
 	"go.pilab.hu/cloud/pico-bot/internal/waftools"
 
 	"github.com/oschwald/maxminddb-golang/v2"
@@ -21,7 +27,23 @@ var wafreportCmd = &cobra.Command{
 	RunE: func(cmd *cobra.Command, args []string) error {
 		initConfig()
 
-		log.Println("Step 1: Parsing WAF logs...")
+		// Initialize threat database
+		threatDBURL := getEnv("THREAT_DB_URL", "")
+		if threatDBURL != "" {
+			threatdb.Init(threatDBURL)
+			log.Println("Refreshing threat database...")
+			if err := threatdb.Refresh(context.Background()); err != nil {
+				log.Printf("Warning: failed to refresh threat DB: %v", err)
+			}
+		}
+
+		// Collect WAF logs from journalctl
+		log.Println("Step 1: Collecting WAF logs from journalctl...")
+		if err := collectWAFLogs(); err != nil {
+			return fmt.Errorf("failed to collect WAF logs: %w", err)
+		}
+
+		log.Println("Step 2: Parsing WAF logs...")
 		threats, err := parseWAFLogs()
 		if err != nil {
 			return fmt.Errorf("failed to parse: %w", err)
@@ -31,15 +53,52 @@ var wafreportCmd = &cobra.Command{
 			return postToSlackWAF([]waftools.Threat{})
 		}
 
-		log.Println("Step 2: Enriching with GeoIP + WHOIS...")
+		log.Println("Step 3: Enriching with GeoIP + WHOIS...")
 		enriched, err := enrichThreats(threats)
 		if err != nil {
 			log.Printf("Enrichment warning: %v", err)
 		}
 
-		log.Println("Step 3: Posting to Slack...")
+		log.Println("Step 4: Posting to Slack...")
 		return postToSlackWAF(enriched)
 	},
+}
+
+func collectWAFLogs() error {
+	logFile := getEnv("WAF_LOG_FILE", "journalctl_vm2_full.log")
+
+	log.Printf("Collecting WAF logs to %s...", logFile)
+
+	// Run journalctl with sudo and filter for waf entries
+	// Add timeout, --no-pager to avoid hanging, and limit to recent entries
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	cmd := exec.CommandContext(ctx, "sudo", "journalctl", "-x", "--no-pager", "--since", "today")
+	output, err := cmd.Output()
+	if err != nil {
+		if ctx.Err() == context.DeadlineExceeded {
+			return fmt.Errorf("journalctl timed out after 30s: %w", err)
+		}
+		return fmt.Errorf("failed to run journalctl: %w", err)
+	}
+
+	// Filter lines containing "waf" (case-insensitive)
+	lines := strings.Split(string(output), "\n")
+	var filtered []string
+	for _, line := range lines {
+		if strings.Contains(strings.ToLower(line), "waf") {
+			filtered = append(filtered, line)
+		}
+	}
+
+	// Write filtered lines to file
+	if err := os.WriteFile(logFile, []byte(strings.Join(filtered, "\n")), 0644); err != nil {
+		return fmt.Errorf("failed to write log file: %w", err)
+	}
+
+	log.Printf("WAF logs collected successfully: %d entries written to %s", len(filtered), logFile)
+	return nil
 }
 
 func parseWAFLogs() ([]waftools.Threat, error) {
@@ -75,16 +134,23 @@ func parseWAFLogs() ([]waftools.Threat, error) {
 
 		if _, exists := threatMap[ip]; !exists {
 			threatMap[ip] = &waftools.Threat{
-				IP:         ip,
-				AttackType: entry.Metric,
-				Method:     entry.Method,
-				URLs:       []string{},
+				IP:            ip,
+				AttackType:    entry.Metric,
+				ThreatCategory: threatdb.GetThreatCategory(entry.Metric),
+				Method:        entry.Method,
+				URLs:          []string{},
+				MaliciousURLs: []string{},
 			}
 		}
 		threatMap[ip].Count++
 
-		if entry.URL != "" && !contains(threatMap[ip].URLs, entry.URL) {
-			threatMap[ip].URLs = append(threatMap[ip].URLs, entry.URL)
+		if entry.URL != "" {
+			if !contains(threatMap[ip].URLs, entry.URL) {
+				threatMap[ip].URLs = append(threatMap[ip].URLs, entry.URL)
+			}
+			if isMaliciousURL(entry.URL) && !contains(threatMap[ip].MaliciousURLs, entry.URL) {
+				threatMap[ip].MaliciousURLs = append(threatMap[ip].MaliciousURLs, entry.URL)
+			}
 		}
 	}
 
@@ -118,6 +184,17 @@ func contains(slice []string, item string) bool {
 		}
 	}
 	return false
+}
+
+func isMaliciousURL(rawURL string) bool {
+	u, err := url.Parse(rawURL)
+	if err != nil {
+		return false
+	}
+	if u.Host == "" {
+		return false
+	}
+	return threatdb.IsMaliciousDomain(u.Host)
 }
 
 type geoCache struct {
@@ -320,6 +397,8 @@ func postToSlackWAF(threats []waftools.Threat) error {
 		makeRichCell("Country", true),
 		makeRichCell("Method", true),
 		makeRichCell("Attack Type", true),
+		makeRichCell("Category", true),
+		makeRichCell("Malicious IP?", true),
 		makeRichCell("Provider", true),
 		makeRichCell("Reqs", true),
 	)
@@ -338,6 +417,16 @@ func postToSlackWAF(threats []waftools.Threat) error {
 			attackType = "-"
 		}
 
+		category := t.ThreatCategory
+		if category == "" {
+			category = "-"
+		}
+
+		maliciousIPStatus := "No"
+		if threatdb.IsMaliciousIP(t.IP) {
+			maliciousIPStatus = "⚠️ Yes"
+		}
+
 		tbl.AddRow(
 			makeRichCell(fmt.Sprintf("%d", i+1), false),
 			makeRichCell(t.IP, false),
@@ -345,6 +434,8 @@ func postToSlackWAF(threats []waftools.Threat) error {
 			makeRichCell(t.Country, false),
 			makeRichCell(method, false),
 			makeRichCell(attackType, false),
+			makeRichCell(category, false),
+			makeRichCell(maliciousIPStatus, false),
 			makeRichCell(provider, false),
 			makeRichCell(fmt.Sprintf("%d", t.Count), false),
 		)
@@ -360,12 +451,16 @@ func postToSlackWAF(threats []waftools.Threat) error {
 		}
 		if len(t.URLs) > 0 {
 			urlText := fmt.Sprintf("*%s* targeted URLs:\n", t.IP)
-			for j, url := range t.URLs {
+			for j, u := range t.URLs {
 				if j >= 5 {
 					urlText += "... and more\n"
 					break
 				}
-				urlText += fmt.Sprintf("• %s\n", url)
+				maliciousMarker := ""
+				if contains(t.MaliciousURLs, u) {
+					maliciousMarker = " ⚠️ MALICIOUS"
+				}
+				urlText += fmt.Sprintf("• `%s`%s\n", u, maliciousMarker)
 			}
 			urlSection := slack.NewSectionBlock(
 				slack.NewTextBlockObject(slack.MarkdownType, urlText, false, false),

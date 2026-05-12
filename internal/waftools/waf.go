@@ -267,15 +267,17 @@ func ParseLogFile(path string) ([]LogEntry, error) {
 }
 
 type Threat struct {
-	IP         string
-	Count      int
-	Country    string
-	ISOCode    string
-	Provider   string
-	AbuseEmail string
-	AttackType string
-	Method     string
-	URLs       []string
+	IP            string
+	Count         int
+	Country       string
+	ISOCode       string
+	Provider      string
+	AbuseEmail    string
+	AttackType    string
+	ThreatCategory string
+	Method        string
+	URLs          []string
+	MaliciousURLs []string
 }
 
 type ThreatDetail struct {

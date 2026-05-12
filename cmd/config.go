@@ -38,7 +38,7 @@ func initConfig() {
 	cfg.SetDefault("REPORT_TODAY_ONLY", true)
 
 	slackBotToken = getEnv("SLACK_BOT_TOKEN", "")
-	slackChannel = getEnv("SLACK_CHANNEL_ID", "")
+	slackChannel = getEnv("SLACK_THREAT_CHANNEL_ID", "")
 	githubToken = getEnv("GITHUB_TOKEN", "")
 	githubOrg = getEnv("GITHUB_ORG", "pilab-dev")
 	githubOrgs = getEnv("GITHUB_ORGS", "pilab-dev,pilab-cloud")
@@ -50,7 +50,7 @@ func initConfig() {
 		log.Fatal("SLACK_BOT_TOKEN is required")
 	}
 	if slackChannel == "" {
-		log.Fatal("SLACK_CHANNEL_ID is required")
+		log.Fatal("SLACK_THREAT_CHANNEL_ID is required")
 	}
 
 	ctx = context.Background()

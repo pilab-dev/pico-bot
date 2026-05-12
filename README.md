@@ -34,7 +34,7 @@ To run the app, you should set the following variables:
 
 ```shell
 export SLACK_BOT_TOKEN="xoxb-slack-bot-token"
-export SLACK_CHANNEL_ID="C051SLACKCHANNEL"
+export SLACK_THREAT_CHANNEL_ID="C051SLACKCHANNEL"
 export GITHUB_TOKEN="your-github-token"
 export GITHUB_ORG="yourorg"
 export GEMINI_API_KEY="gemini-api-key-from-ai-studio"

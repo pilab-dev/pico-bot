@@ -4,3 +4,5 @@ bin
 # Ignore debugging files
 *.log
 *.txt
+# Ignore compiled binary
+pico-bot
